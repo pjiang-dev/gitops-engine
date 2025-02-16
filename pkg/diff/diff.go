@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 
 	jsonpatch "github.com/evanphx/json-patch/v5"
 	corev1 "k8s.io/api/core/v1"
@@ -37,6 +38,7 @@ const (
 	couldNotMarshalErrMsg       = "Could not unmarshal to object of type %s: %v"
 	AnnotationLastAppliedConfig = "kubectl.kubernetes.io/last-applied-configuration"
 	replacement                 = "++++++++"
+	fieldManagerName            = "argocd-controller"
 )
 
 // Holds diffing result of two resources
@@ -220,57 +222,60 @@ func removeWebhookMutation(predictedLive, live *unstructured.Unstructured, gvkPa
 		return nil, fmt.Errorf("error converting live state from unstructured to %s: %w", gvk, err)
 	}
 
-	// Compare the predicted live with the live resource
-	comparison, err := typedLive.Compare(typedPredictedLive)
-	if err != nil {
-		return nil, fmt.Errorf("error comparing predicted resource to live resource: %w", err)
-	}
+	// Initialize an empty fieldpath.Set to aggregate managed fields
+	argocdControllerFields := &fieldpath.Set{}
 
-	// Loop over all existing managers in predicted live resource to identify
-	// fields mutated (in predicted live) not owned by any manager.
+	// Iterate over all ManagedFields entries in predictedLive
 	for _, mfEntry := range plManagedFields {
-		mfs := &fieldpath.Set{}
-		err := mfs.FromJSON(bytes.NewReader(mfEntry.FieldsV1.Raw))
+		managedFieldsSet := &fieldpath.Set{}
+		err := managedFieldsSet.FromJSON(bytes.NewReader(mfEntry.FieldsV1.Raw))
 		if err != nil {
-			return nil, fmt.Errorf("error building managedFields set: %w", err)
+			return nil, fmt.Errorf("error building managedFields set: %s", err)
 		}
-		if comparison.Added != nil && !comparison.Added.Empty() {
-			// exclude the added fields owned by this manager from the comparison
-			comparison.Added = comparison.Added.Difference(mfs)
-		}
-		if comparison.Modified != nil && !comparison.Modified.Empty() {
-			// exclude the modified fields owned by this manager from the comparison
-			comparison.Modified = comparison.Modified.Difference(mfs)
-		}
-		if comparison.Removed != nil && !comparison.Removed.Empty() {
-			// exclude the removed fields owned by this manager from the comparison
-			comparison.Removed = comparison.Removed.Difference(mfs)
-		}
-	}
-	// At this point, comparison holds all mutations that aren't owned by any
-	// of the existing managers.
-
-	if comparison.Added != nil && !comparison.Added.Empty() {
-		// remove added fields that aren't owned by any manager
-		typedPredictedLive = typedPredictedLive.RemoveItems(comparison.Added)
-	}
-
-	if comparison.Modified != nil && !comparison.Modified.Empty() {
-		liveModValues := typedLive.ExtractItems(comparison.Modified, typed.WithAppendKeyFields())
-		// revert modified fields not owned by any manager
-		typedPredictedLive, err = typedPredictedLive.Merge(liveModValues)
-		if err != nil {
-			return nil, fmt.Errorf("error reverting webhook modified fields in predicted live resource: %w", err)
+		if mfEntry.Manager == fieldManagerName {
+			// Union the fields with the aggregated set
+			argocdControllerFields = argocdControllerFields.Union(managedFieldsSet)
 		}
 	}
 
-	if comparison.Removed != nil && !comparison.Removed.Empty() {
-		liveRmValues := typedLive.ExtractItems(comparison.Removed, typed.WithAppendKeyFields())
-		// revert removed fields not owned by any manager
-		typedPredictedLive, err = typedPredictedLive.Merge(liveRmValues)
-		if err != nil {
-			return nil, fmt.Errorf("error reverting webhook removed fields in predicted live resource: %w", err)
+	if argocdControllerFields.Empty() {
+		return nil, fmt.Errorf("no managed fields found for manager: argocd-controller")
+	}
+
+	predictedLiveFieldSet, err := typedPredictedLive.ToFieldSet()
+	if err != nil {
+		return nil, fmt.Errorf("error converting predicted live state to FieldSet: %w", err)
+	}
+
+	// Remove non argocd-controller fields from predicted live. This will give us predicted live with only changes from argocd-controller
+	nonArgoFieldsSet := predictedLiveFieldSet.Difference(argocdControllerFields)
+
+	// Create a new set to store fields to be removed
+	fieldsToRemove := fieldpath.NewSet()
+
+	// Iterate through nonArgoFieldsSet to remove any defaulted fields like protocol
+	nonArgoFieldsSet.Iterate(func(p fieldpath.Path) {
+		shouldRemove := true
+		for _, element := range p {
+			if element.FieldName != nil && strings.HasSuffix(*element.FieldName, "protocol") {
+				shouldRemove = false
+				break
+			}
 		}
+		if shouldRemove {
+			fieldsToRemove.Insert(p)
+		}
+	})
+
+	// Update nonArgoFieldsSet to only include fields that don't end with "protocol"
+	nonArgoFieldsSet = fieldsToRemove
+
+	typedPredictedLive = typedPredictedLive.RemoveItems(nonArgoFieldsSet)
+	// Apply the predicted live state to the live state to get a diff without mutation webhook fields
+	typedPredictedLive, err = typedLive.Merge(typedPredictedLive)
+
+	if err != nil {
+		return nil, fmt.Errorf("error applying predicted live to live state: %w", err)
 	}
 
 	plu := typedPredictedLive.AsValue().Unstructured()
