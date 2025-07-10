@@ -1393,3 +1393,97 @@ func BenchmarkIterateHierarchyV2(b *testing.B) {
 //		})
 //	}
 //}
+
+func TestInvalidateResources(t *testing.T) {
+	// Create test resources
+	pod1 := testPod1()
+	pod2 := testPod2()
+	rs := testRS()
+	deploy := testDeploy()
+
+	// Test invalidating specific resources
+	t.Run("InvalidateSpecificResources", func(t *testing.T) {
+		cluster := newCluster(t, pod1, pod2, rs, deploy)
+		err := cluster.EnsureSynced()
+		require.NoError(t, err)
+
+		// Verify all resources are initially in cache
+		initialResources := cluster.resources
+		require.Len(t, initialResources, 4)
+
+		keysToInvalidate := []kube.ResourceKey{
+			kube.GetResourceKey(mustToUnstructured(pod1)),
+			kube.GetResourceKey(mustToUnstructured(pod2)),
+		}
+
+		cluster.InvalidateResources(keysToInvalidate)
+
+		// Verify the specific resources were removed from cache
+		for _, key := range keysToInvalidate {
+			_, exists := cluster.resources[key]
+			assert.False(t, exists, "Resource %s should have been invalidated", key.String())
+		}
+
+		// Verify other resources remain in cache
+		rsKey := kube.GetResourceKey(mustToUnstructured(rs))
+		deployKey := kube.GetResourceKey(mustToUnstructured(deploy))
+
+		_, exists := cluster.resources[rsKey]
+		assert.True(t, exists, "Resource %s should still be in cache", rsKey.String())
+
+		_, exists = cluster.resources[deployKey]
+		assert.True(t, exists, "Resource %s should still be in cache", deployKey.String())
+	})
+
+	t.Run("InvalidateEmptyList", func(t *testing.T) {
+		cluster := newCluster(t, pod1, pod2, rs, deploy)
+		err := cluster.EnsureSynced()
+		require.NoError(t, err)
+
+		initialCount := len(cluster.resources)
+		cluster.InvalidateResources([]kube.ResourceKey{})
+
+		// Verify no resources were removed
+		assert.Equal(t, initialCount, len(cluster.resources), "No resources should have been invalidated")
+	})
+
+	t.Run("InvalidateNonExistentResources", func(t *testing.T) {
+		cluster := newCluster(t, pod1, pod2, rs, deploy)
+		err := cluster.EnsureSynced()
+		require.NoError(t, err)
+
+		initialCount := len(cluster.resources)
+		nonExistentKey := kube.ResourceKey{
+			Group:     "apps",
+			Kind:      "Deployment",
+			Namespace: "non-existent",
+			Name:      "non-existent-deploy",
+		}
+
+		cluster.InvalidateResources([]kube.ResourceKey{nonExistentKey})
+
+		// Verify no resources were removed
+		assert.Equal(t, initialCount, len(cluster.resources), "No resources should have been invalidated")
+	})
+
+	t.Run("InvalidateResourcesUpdatesNamespaceIndex", func(t *testing.T) {
+		cluster := newCluster(t, pod1, pod2, rs, deploy)
+		err := cluster.EnsureSynced()
+		require.NoError(t, err)
+
+		pod1Key := kube.GetResourceKey(mustToUnstructured(pod1))
+
+		// Verify resource is in namespace index
+		nsResources := cluster.nsIndex[pod1Key.Namespace]
+		_, exists := nsResources[pod1Key]
+		assert.True(t, exists, "Resource should exist in namespace index")
+
+		// Invalidate the resource
+		cluster.InvalidateResources([]kube.ResourceKey{pod1Key})
+
+		// Verify resource is removed from namespace index
+		nsResources = cluster.nsIndex[pod1Key.Namespace]
+		_, exists = nsResources[pod1Key]
+		assert.False(t, exists, "Resource should be removed from namespace index")
+	})
+}
