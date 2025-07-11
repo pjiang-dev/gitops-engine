@@ -1444,7 +1444,7 @@ func TestInvalidateResources(t *testing.T) {
 		cluster.InvalidateResources([]kube.ResourceKey{})
 
 		// Verify no resources were removed
-		assert.Equal(t, initialCount, len(cluster.resources), "No resources should have been invalidated")
+		assert.Len(t, cluster.resources, initialCount, "No resources should have been invalidated")
 	})
 
 	t.Run("InvalidateNonExistentResources", func(t *testing.T) {
@@ -1463,7 +1463,7 @@ func TestInvalidateResources(t *testing.T) {
 		cluster.InvalidateResources([]kube.ResourceKey{nonExistentKey})
 
 		// Verify no resources were removed
-		assert.Equal(t, initialCount, len(cluster.resources), "No resources should have been invalidated")
+		assert.Len(t, cluster.resources, initialCount, "No resources should have been invalidated")
 	})
 
 	t.Run("InvalidateResourcesUpdatesNamespaceIndex", func(t *testing.T) {
